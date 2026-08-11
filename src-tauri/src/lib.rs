@@ -17,16 +17,15 @@ struct ImageFile {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ImagePair {
+struct ImageGroup {
     id: String,
-    left: ImageFile,
-    right: ImageFile,
+    images: Vec<ImageFile>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanResult {
-    pairs: Vec<ImagePair>,
+    groups: Vec<ImageGroup>,
     skipped_count: usize,
     ready_to_rename_count: usize,
 }
@@ -47,8 +46,7 @@ struct ScriptSplitResult {
 
 #[derive(Default)]
 struct PairCandidates {
-    left: Option<ImageFile>,
-    right: Option<ImageFile>,
+    images: BTreeMap<u8, ImageFile>,
     candidate_count: usize,
 }
 
@@ -82,38 +80,35 @@ fn scan_image_pairs(folder_path: String) -> Result<ScanResult, String> {
         };
 
         let image = image_file(&path);
-        let pair = candidates.entry(pair_id).or_default();
-        pair.candidate_count += 1;
-        let destination = if side == 1 {
-            &mut pair.left
-        } else {
-            &mut pair.right
-        };
-        if destination.is_some() {
+        let group = candidates.entry(pair_id).or_default();
+        group.candidate_count += 1;
+        if group.images.contains_key(&side) {
             // A duplicate side is ambiguous. Leave it untouched instead of deleting the wrong file.
             skipped_count += 1;
         } else {
-            *destination = Some(image);
+            group.images.insert(side, image);
         }
     }
 
-    let mut pairs = Vec::new();
+    let mut groups = Vec::new();
     for (id, candidate) in candidates {
         let candidate_count = candidate.candidate_count;
-        match (candidate.left, candidate.right) {
-            (Some(left), Some(right)) => pairs.push(ImagePair { id, left, right }),
-            (Some(_), None) | (None, Some(_)) => {
-                if candidate_count == 1 {
-                    ready_to_rename_count += 1;
-                }
-                skipped_count += 1;
-            }
-            (None, None) => {}
+        let image_count = candidate.images.len();
+        if candidate_count != image_count || image_count > 8 {
+            skipped_count += candidate_count;
+        } else if image_count >= 2 {
+            groups.push(ImageGroup {
+                id,
+                images: candidate.images.into_values().collect(),
+            });
+        } else if image_count == 1 {
+            ready_to_rename_count += 1;
+            skipped_count += 1;
         }
     }
 
     Ok(ScanResult {
-        pairs,
+        groups,
         skipped_count,
         ready_to_rename_count,
     })
@@ -147,34 +142,39 @@ fn load_image_data_url(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn finalize_selection(keep_path: String, discard_path: String) -> Result<(), String> {
+fn finalize_selection(keep_path: String, discard_paths: Vec<String>) -> Result<(), String> {
     let keep_path = PathBuf::from(keep_path);
-    let discard_path = PathBuf::from(discard_path);
-    let final_path = final_image_path(&keep_path, &discard_path)?;
+    let discard_paths: Vec<PathBuf> = discard_paths.into_iter().map(PathBuf::from).collect();
+    let final_path = final_image_path(&keep_path, &discard_paths)?;
 
     fs::rename(&keep_path, &final_path)
         .map_err(|error| format!("선택한 이미지의 이름을 바꾸지 못했습니다: {error}"))?;
 
-    if let Err(error) = trash::delete(&discard_path) {
-        let rollback_result = fs::rename(&final_path, &keep_path);
-        return match rollback_result {
-            Ok(()) => Err(format!(
-                "선택하지 않은 이미지를 휴지통으로 옮기지 못했습니다: {error}"
-            )),
-            Err(rollback_error) => Err(format!(
-                "휴지통 이동에 실패했고 파일명 복구도 실패했습니다: {error}; {rollback_error}"
-            )),
-        };
+    for discard_path in discard_paths {
+        if let Err(error) = trash::delete(&discard_path) {
+            let rollback_result = fs::rename(&final_path, &keep_path);
+            return match rollback_result {
+                Ok(()) => Err(format!(
+                    "선택하지 않은 이미지를 휴지통으로 옮기지 못했습니다: {error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "휴지통 이동에 실패했고 파일명 복구도 실패했습니다: {error}; {rollback_error}"
+                )),
+            };
+        }
     }
 
     Ok(())
 }
 
-fn final_image_path(keep_path: &Path, discard_path: &Path) -> Result<PathBuf, String> {
-    if !keep_path.is_file() || !discard_path.is_file() {
+fn final_image_path(keep_path: &Path, discard_paths: &[PathBuf]) -> Result<PathBuf, String> {
+    if !keep_path.is_file()
+        || discard_paths.is_empty()
+        || discard_paths.iter().any(|path| !path.is_file())
+    {
         return Err("선택할 이미지 파일을 찾지 못했습니다.".into());
     }
-    if !is_image_path(keep_path) || !is_image_path(discard_path) {
+    if !is_image_path(keep_path) || discard_paths.iter().any(|path| !is_image_path(path)) {
         return Err("PNG, JPG, JPEG 파일만 선택할 수 있습니다.".into());
     }
 
@@ -182,17 +182,21 @@ fn final_image_path(keep_path: &Path, discard_path: &Path) -> Result<PathBuf, St
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or("선택한 이미지의 파일명을 읽지 못했습니다.")?;
-    let discard_stem = discard_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or("선택하지 않은 이미지의 파일명을 읽지 못했습니다.")?;
     let (pair_id, keep_side) =
         split_pair_name(keep_stem).ok_or("선택한 이미지가 올바른 쌍 파일명이 아닙니다.")?;
-    let (discard_id, discard_side) = split_pair_name(discard_stem)
-        .ok_or("선택하지 않은 이미지가 올바른 쌍 파일명이 아닙니다.")?;
+    let mut selected_sides = BTreeMap::new();
+    selected_sides.insert(keep_side, keep_path);
+    for discard_path in discard_paths {
+        let discard_stem = discard_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or("선택하지 않은 이미지의 파일명을 읽지 못했습니다.")?;
+        let (discard_id, discard_side) = split_pair_name(discard_stem)
+            .ok_or("선택하지 않은 이미지의 파일명이 올바르지 않습니다.")?;
 
-    if pair_id != discard_id || keep_side == discard_side {
-        return Err("같은 이미지 쌍에서 하나씩만 선택할 수 있습니다.".into());
+        if pair_id != discard_id || selected_sides.insert(discard_side, discard_path).is_some() {
+            return Err("같은 번호의 후보 이미지에서 하나만 선택할 수 있습니다.".into());
+        }
     }
 
     let extension = keep_path
@@ -401,14 +405,16 @@ fn is_image_path(path: &Path) -> bool {
 }
 
 fn split_pair_name(stem: &str) -> Option<(String, u8)> {
-    for (suffix, side) in [("-01", 1), ("-02", 2), ("-1", 1), ("-2", 2)] {
-        if let Some(prefix) = stem.strip_suffix(suffix) {
-            if !prefix.is_empty() {
-                return Some((prefix.to_owned(), side));
-            }
-        }
+    let (prefix, suffix) = stem.rsplit_once('-')?;
+    if prefix.is_empty() || suffix.is_empty() || suffix.len() > 2 {
+        return None;
     }
-    None
+    let side = suffix.parse::<u8>().ok()?;
+    if (1..=8).contains(&side) {
+        Some((prefix.to_owned(), side))
+    } else {
+        None
+    }
 }
 
 pub fn run() {
@@ -431,13 +437,15 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        character_count, final_image_path, split_pair_name, split_script_text, SCRIPT_CHUNK_LIMIT,
+        character_count, final_image_path, scan_image_pairs, split_pair_name, split_script_text,
+        SCRIPT_CHUNK_LIMIT,
     };
 
     #[test]
     fn recognizes_zero_padded_pair_names() {
         assert_eq!(split_pair_name("000-01"), Some(("000".into(), 1)));
         assert_eq!(split_pair_name("000-02"), Some(("000".into(), 2)));
+        assert_eq!(split_pair_name("000-08"), Some(("000".into(), 8)));
     }
 
     #[test]
@@ -449,7 +457,27 @@ mod tests {
     #[test]
     fn ignores_non_pair_names() {
         assert_eq!(split_pair_name("mandol"), None);
-        assert_eq!(split_pair_name("001-3"), None);
+        assert_eq!(split_pair_name("001-09"), None);
+        assert_eq!(split_pair_name("001-001"), None);
+    }
+
+    #[test]
+    fn groups_up_to_eight_candidates_in_numeric_order() {
+        let folder =
+            std::env::temp_dir().join(format!("pair-picker-candidates-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        for side in 1..=8 {
+            std::fs::write(folder.join(format!("001-{side:02}.jpeg")), []).unwrap();
+        }
+
+        let result = scan_image_pairs(folder.to_string_lossy().into_owned()).unwrap();
+
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].images.len(), 8);
+        assert_eq!(result.groups[0].images[0].file_name, "001-01.jpeg");
+        assert_eq!(result.groups[0].images[7].file_name, "001-08.jpeg");
+
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
@@ -462,7 +490,7 @@ mod tests {
         std::fs::write(&discard, []).unwrap();
 
         assert_eq!(
-            final_image_path(&keep, &discard).unwrap(),
+            final_image_path(&keep, &[discard]).unwrap(),
             Path::new(&folder).join("001.jpeg")
         );
 
@@ -480,7 +508,7 @@ mod tests {
         std::fs::write(&discard, []).unwrap();
         std::fs::write(folder.join("001.png"), []).unwrap();
 
-        assert!(final_image_path(&keep, &discard).is_err());
+        assert!(final_image_path(&keep, &[discard]).is_err());
 
         std::fs::remove_dir_all(folder).unwrap();
     }

@@ -9,14 +9,13 @@ type ImageFile = {
   fileName: string;
 };
 
-type ImagePair = {
+type ImageGroup = {
   id: string;
-  left: ImageFile;
-  right: ImageFile;
+  images: ImageFile[];
 };
 
 type ScanResult = {
-  pairs: ImagePair[];
+  groups: ImageGroup[];
   skippedCount: number;
   readyToRenameCount: number;
 };
@@ -27,9 +26,8 @@ type NormalizeResult = {
 };
 
 type Preview = {
-  pairId: string;
-  left: string;
-  right: string;
+  groupId: string;
+  sources: string[];
 };
 
 type Tool = "image" | "script";
@@ -40,6 +38,7 @@ type ScriptDrop = {
 };
 
 const isUsablePath = (value: string) => value.trim().length > 0;
+const APP_VERSION = "v0.2.0";
 
 function filePathFromDrop(value: string) {
   const firstValue = value.split(/\r?\n/).find(Boolean)?.trim() ?? "";
@@ -60,7 +59,7 @@ export default function App() {
   const [activeTool, setActiveTool] = useState<Tool>("image");
   const [scriptDroppedFile, setScriptDroppedFile] = useState<ScriptDrop | null>(null);
   const [folderPath, setFolderPath] = useState("");
-  const [pairs, setPairs] = useState<ImagePair[]>([]);
+  const [groups, setGroups] = useState<ImageGroup[]>([]);
   const [skippedCount, setSkippedCount] = useState(0);
   const [readyToRenameCount, setReadyToRenameCount] = useState(0);
   const [legacyRenamedCount, setLegacyRenamedCount] = useState<number | null>(null);
@@ -71,9 +70,9 @@ export default function App() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [error, setError] = useState("");
 
-  const activePair = pairs[pairIndex];
-  const progress = pairs.length === 0 ? 0 : (pairIndex / pairs.length) * 100;
-  const isFinished = pairs.length > 0 && pairIndex >= pairs.length;
+  const activeGroup = groups[pairIndex];
+  const progress = groups.length === 0 ? 0 : (pairIndex / groups.length) * 100;
+  const isFinished = groups.length > 0 && pairIndex >= groups.length;
 
   const loadFolder = useCallback(async (path: string) => {
     if (!isUsablePath(path)) return;
@@ -85,18 +84,18 @@ export default function App() {
     try {
       const result = await invoke<ScanResult>("scan_image_pairs", { folderPath: path.trim() });
       setFolderPath(path.trim());
-      setPairs(result.pairs);
+      setGroups(result.groups);
       setSkippedCount(result.skippedCount);
       setReadyToRenameCount(result.readyToRenameCount);
       setLegacyRenamedCount(null);
       setPairIndex(0);
       setCompletedCount(0);
 
-      if (result.pairs.length === 0) {
-        setError("완전한 -1/-2 또는 -01/-02 이미지 쌍을 찾지 못했습니다.");
+      if (result.groups.length === 0) {
+        setError("후보가 2~8장인 번호별 이미지 묶음을 찾지 못했습니다.");
       }
     } catch (reason) {
-      setPairs([]);
+      setGroups([]);
       setReadyToRenameCount(0);
       setLegacyRenamedCount(null);
       setPairIndex(0);
@@ -111,7 +110,7 @@ export default function App() {
     const selected = await open({
       directory: true,
       multiple: false,
-      title: "이미지 쌍이 있는 폴더 선택",
+      title: "후보 이미지가 있는 폴더 선택",
     });
 
     if (typeof selected === "string") {
@@ -140,7 +139,7 @@ export default function App() {
   }, [activeTool, loadFolder]);
 
   useEffect(() => {
-    if (!activePair) {
+    if (!activeGroup) {
       setPreview(null);
       return;
     }
@@ -149,12 +148,11 @@ export default function App() {
     setPreview(null);
     setError("");
 
-    void Promise.all([
-      invoke<string>("load_image_data_url", { path: activePair.left.path }),
-      invoke<string>("load_image_data_url", { path: activePair.right.path }),
-    ])
-      .then(([left, right]) => {
-        if (!cancelled) setPreview({ pairId: activePair.id, left, right });
+    void Promise.all(
+      activeGroup.images.map((image) => invoke<string>("load_image_data_url", { path: image.path })),
+    )
+      .then((sources) => {
+        if (!cancelled) setPreview({ groupId: activeGroup.id, sources });
       })
       .catch((reason) => {
         if (!cancelled) setError(`이미지를 불러오지 못했습니다: ${String(reason)}`);
@@ -163,21 +161,22 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activePair]);
+  }, [activeGroup]);
 
   const selectImage = useCallback(
-    async (keep: "left" | "right") => {
-      if (!activePair || isDeleting || !preview) return;
+    async (keep: ImageFile) => {
+      if (!activeGroup || isDeleting || !preview) return;
 
       setIsDeleting(true);
       setError("");
-      const kept = keep === "left" ? activePair.left : activePair.right;
-      const rejected = keep === "left" ? activePair.right : activePair.left;
+      const discardPaths = activeGroup.images
+        .filter((image) => image.path !== keep.path)
+        .map((image) => image.path);
 
       try {
         await invoke("finalize_selection", {
-          keepPath: kept.path,
-          discardPath: rejected.path,
+          keepPath: keep.path,
+          discardPaths,
         });
         setCompletedCount((count) => count + 1);
         setPairIndex((index) => index + 1);
@@ -187,7 +186,7 @@ export default function App() {
         setIsDeleting(false);
       }
     },
-    [activePair, isDeleting, preview],
+    [activeGroup, isDeleting, preview],
   );
 
   const normalizeRemainingImages = useCallback(async () => {
@@ -210,22 +209,23 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (activeTool !== "image") return;
-      if (event.key === "1" || event.key === "ArrowLeft") void selectImage("left");
-      if (event.key === "2" || event.key === "ArrowRight") void selectImage("right");
+      const imageIndex = event.key === "ArrowLeft" ? 0 : event.key === "ArrowRight" ? 1 : Number(event.key) - 1;
+      const image = activeGroup?.images[imageIndex];
+      if (image) void selectImage(image);
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTool, selectImage]);
+  }, [activeGroup, activeTool, selectImage]);
 
   const statusMessage = useMemo(() => {
-    if (isLoading) return "폴더에서 이미지 쌍을 찾고 있습니다…";
+    if (isLoading) return "폴더에서 번호별 후보 이미지를 찾고 있습니다…";
     if (isDeleting) return "선택 결과를 정리하고 있습니다…";
     if (legacyRenamedCount !== null) return `${legacyRenamedCount}장의 파일명을 정리했습니다.`;
-    if (isFinished) return "모든 이미지 쌍을 정리했습니다.";
-    if (activePair) return `${pairIndex + 1} / ${pairs.length} 쌍`;
+    if (isFinished) return "모든 번호의 후보 이미지를 정리했습니다.";
+    if (activeGroup) return `${pairIndex + 1} / ${groups.length} 번호 · 후보 ${activeGroup.images.length}장`;
     return "폴더를 선택하거나 여기로 드래그하세요.";
-  }, [activePair, isDeleting, isFinished, isLoading, pairIndex, pairs.length]);
+  }, [activeGroup, groups.length, isDeleting, isFinished, isLoading, pairIndex]);
 
   const acceptTextDrop = (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
@@ -246,8 +246,8 @@ export default function App() {
         <div className="brand">
           <span className="brand-mark">PP</span>
           <div>
-            <h1>Pair Picker</h1>
-            <p>{activeTool === "image" ? "둘 중 남길 한 장을 선택하세요" : "대본을 단락 단위로 나눕니다"}</p>
+            <h1>Pair Picker <span className="app-version">{APP_VERSION}</span></h1>
+            <p>{activeTool === "image" ? "후보 중 남길 한 장을 선택하세요" : "대본을 단락 단위로 나눕니다"}</p>
           </div>
         </div>
         <nav className="tool-tabs" aria-label="도구 선택">
@@ -278,11 +278,11 @@ export default function App() {
         <div className="status-copy">
           <span className={`status-dot ${isDeleting || isLoading ? "working" : ""}`} />
           <span>{statusMessage}</span>
-          {skippedCount > 0 && <small>쌍이 아닌 이미지 또는 완전하지 않은 쌍 {skippedCount}개는 건드리지 않습니다.</small>}
+          {skippedCount > 0 && <small>후보가 2~8장이 아닌 번호 또는 형식이 맞지 않는 이미지 {skippedCount}개는 건드리지 않습니다.</small>}
         </div>
-        {pairs.length > 0 && (
+        {groups.length > 0 && (
           <div className="progress-wrap" aria-label={`진행률 ${Math.round(progress)}%`}>
-            <span>{completedCount}장 선택 · {pairs.length - pairIndex}쌍 남음</span>
+            <span>{completedCount}장 선택 · {groups.length - pairIndex}개 번호 남음</span>
             <div className="progress-track"><div className="progress-value" style={{ width: `${progress}%` }} /></div>
           </div>
         )}
@@ -290,32 +290,25 @@ export default function App() {
 
       {error && <div className="error-message" role="alert">{error}</div>}
 
-      <section className="pair-stage" aria-busy={isDeleting || isLoading}>
+      <section className={`pair-stage image-count-${activeGroup?.images.length ?? 0}`} aria-busy={isDeleting || isLoading}>
         {isFinished ? (
           <div className="complete-state">
             <span className="complete-icon">✓</span>
             <h2>정리가 완료되었습니다</h2>
-            <p>{completedCount}쌍에서 선택한 {completedCount}장을 남기고, 나머지는 휴지통으로 옮겼습니다.</p>
+            <p>{completedCount}개 번호에서 선택한 {completedCount}장을 남기고, 나머지는 휴지통으로 옮겼습니다.</p>
             <button type="button" onClick={() => void chooseFolder()}>다른 폴더 선택</button>
           </div>
-        ) : activePair ? (
-          <>
+        ) : activeGroup ? (
+          activeGroup.images.map((image, index) => (
             <ImageCanvas
-              image={activePair.left}
-              source={preview?.pairId === activePair.id ? preview.left : undefined}
-              side="1"
+              key={image.path}
+              image={image}
+              source={preview?.groupId === activeGroup.id ? preview.sources[index] : undefined}
+              side={index + 1}
               disabled={isDeleting || !preview}
-              onSelect={() => void selectImage("left")}
+              onSelect={() => void selectImage(image)}
             />
-            <div className="stage-divider"><span>KEEP</span></div>
-            <ImageCanvas
-              image={activePair.right}
-              source={preview?.pairId === activePair.id ? preview.right : undefined}
-              side="2"
-              disabled={isDeleting || !preview}
-              onSelect={() => void selectImage("right")}
-            />
-          </>
+          ))
         ) : readyToRenameCount > 0 ? (
           <div className="complete-state">
             <span className="complete-icon">↺</span>
@@ -334,15 +327,15 @@ export default function App() {
           <div className="empty-state">
             <span className="empty-icon">↙</span>
             <h2>이미지 폴더를 놓아주세요</h2>
-            <p><code>-1 / -2</code> 또는 <code>-01 / -02</code>로 끝나는 PNG, JPG, JPEG 파일을 자동으로 쌍으로 묶습니다.</p>
+            <p><code>-01</code>부터 <code>-08</code>까지 같은 번호의 PNG, JPG, JPEG 파일을 묶습니다. 한 번호에 2~8장 중 한 장을 선택할 수 있습니다.</p>
             <button type="button" onClick={() => void chooseFolder()}>폴더 선택</button>
           </div>
         )}
       </section>
 
       <footer>
-        <span>클릭한 이미지는 <code>001.jpeg</code>처럼 이름을 정리하고, 반대쪽 이미지는 휴지통으로 이동합니다.</span>
-        <span>단축키: <kbd>1</kbd>/<kbd>←</kbd> 왼쪽 · <kbd>2</kbd>/<kbd>→</kbd> 오른쪽</span>
+        <span>클릭한 이미지는 <code>001.jpeg</code>처럼 이름을 정리하고, 같은 번호의 나머지 후보는 휴지통으로 이동합니다.</span>
+        <span>단축키: <kbd>1</kbd>~<kbd>8</kbd> · <kbd>←</kbd> 1번 · <kbd>→</kbd> 2번</span>
       </footer>
       </> : <ScriptSplitter
         droppedFile={scriptDroppedFile}
@@ -355,7 +348,7 @@ export default function App() {
 type ImageCanvasProps = {
   image: ImageFile;
   source?: string;
-  side: "1" | "2";
+  side: number;
   disabled: boolean;
   onSelect: () => void;
 };

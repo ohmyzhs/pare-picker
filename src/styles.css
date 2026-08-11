@@ -16,6 +16,7 @@ button:disabled { cursor: wait; }
 .brand { display: flex; align-items: center; gap: 11px; flex: 0 0 auto; }
 .brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid #f0bd54; border-radius: 10px; color: #16120b; background: linear-gradient(135deg, #ffda79, #d89925); font-size: 11px; font-weight: 900; letter-spacing: -.08em; }
 h1 { margin: 0; font-size: 16px; letter-spacing: -.04em; }
+.app-version { margin-left: 5px; color: #a8abb3; font-size: 10px; font-weight: 650; letter-spacing: 0; }
 .brand p { margin: 2px 0 0; color: #9ea1a9; font-size: 12px; }
 .tool-tabs { display: flex; align-self: stretch; align-items: center; gap: 3px; padding: 0 5px; border: 1px solid #303238; border-radius: 9px; background: #1a1b1f; }
 .tool-tabs button { height: 34px; border: 0; border-radius: 6px; padding: 0 12px; color: #9ea1a9; background: transparent; font-size: 12px; font-weight: 750; white-space: nowrap; }
@@ -38,7 +39,9 @@ h1 { margin: 0; font-size: 16px; letter-spacing: -.04em; }
 .progress-value { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #e6ae43, #ffe093); transition: width .24s ease; }
 .error-message { margin: 10px 24px 0; z-index: 2; border: 1px solid #6b3535; border-radius: 8px; padding: 9px 12px; color: #ffd0d0; background: #3e2020; font-size: 13px; }
 
-.pair-stage { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr); padding: 18px; gap: 18px; }
+.pair-stage { min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 18px; gap: 18px; }
+.pair-stage.image-count-5, .pair-stage.image-count-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pair-stage.image-count-7, .pair-stage.image-count-8 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .image-canvas { position: relative; display: grid; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #34363d; border-radius: 13px; padding: 0; color: #eeeef0; background: #17181c; isolation: isolate; transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease; }
 .image-canvas:hover:not(:disabled) { border-color: #f2c35a; transform: translateY(-2px); box-shadow: 0 16px 35px rgb(0 0 0 / 32%); }
 .image-canvas:focus-visible { outline: 3px solid #f2c35a; outline-offset: 3px; }
@@ -51,9 +54,6 @@ h1 { margin: 0; font-size: 16px; letter-spacing: -.04em; }
 .keep-overlay span { border-radius: 6px; padding: 7px 9px; color: #17130b; background: #f2c35a; font-size: 12px; font-weight: 850; }
 .keep-overlay small { padding: 3px 5px 0; color: #e7e8eb; font-size: 10px; }
 .image-loader { width: 36px; height: 36px; align-self: center; justify-self: center; border: 3px solid #3c3e44; border-top-color: #eec15a; border-radius: 99px; animation: spin .8s linear infinite; }
-.stage-divider { display: grid; align-items: center; justify-content: center; }
-.stage-divider::before { content: ""; height: 100%; width: 1px; background: linear-gradient(transparent, #4a4c53 13%, #4a4c53 87%, transparent); }
-.stage-divider span { position: absolute; z-index: 1; border: 1px solid #4b4d54; border-radius: 99px; padding: 5px 4px; color: #aeb0b8; background: #202125; font-size: 9px; font-weight: 850; writing-mode: vertical-rl; letter-spacing: .1em; }
 
 .empty-state, .complete-state { grid-column: 1 / -1; display: grid; align-content: center; justify-items: center; gap: 10px; min-height: 100%; padding-bottom: 40px; text-align: center; color: #c8c9cf; }
 .empty-state h2, .complete-state h2 { margin: 0; color: #f1f1f2; font-size: 24px; letter-spacing: -.04em; }

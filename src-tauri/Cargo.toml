@@ -1,6 +1,6 @@
 [package]
 name = "pair-picker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Choose one image from each pair"
 authors = ["Gabriel"]
 edition = "2021"
