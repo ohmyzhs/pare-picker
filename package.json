@@ -1,12 +1,14 @@
 {
   "name": "pair-picker",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.2",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
-    "build:windows": "tauri build --no-bundle",
+    "version:patch": "node scripts/bump-version.mjs patch",
+    "build:mac": "npm run version:patch && tauri build --bundles app,dmg",
+    "build:windows": "npm run version:patch && tauri build --bundles nsis",
     "tauri": "tauri"
   },
   "dependencies": {

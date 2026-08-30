@@ -7,6 +7,8 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 
+mod enhance;
+
 const SCRIPT_CHUNK_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +30,7 @@ struct ScanResult {
     groups: Vec<ImageGroup>,
     skipped_count: usize,
     ready_to_rename_count: usize,
+    ready_to_enhance_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,7 +62,8 @@ fn scan_image_pairs(folder_path: String) -> Result<ScanResult, String> {
 
     let mut candidates: BTreeMap<String, PairCandidates> = BTreeMap::new();
     let mut skipped_count = 0;
-    let mut ready_to_rename_count = 0;
+    let ready_to_rename_count = 0;
+    let mut ready_to_enhance_count = 0;
 
     for entry in
         fs::read_dir(&folder).map_err(|error| format!("폴더를 읽지 못했습니다: {error}"))?
@@ -74,6 +78,10 @@ fn scan_image_pairs(folder_path: String) -> Result<ScanResult, String> {
             skipped_count += 1;
             continue;
         };
+        if !stem.is_empty() && stem.chars().all(|character| character.is_ascii_digit()) {
+            ready_to_enhance_count += 1;
+            continue;
+        }
         let Some((pair_id, side)) = split_pair_name(stem) else {
             skipped_count += 1;
             continue;
@@ -82,11 +90,11 @@ fn scan_image_pairs(folder_path: String) -> Result<ScanResult, String> {
         let image = image_file(&path);
         let group = candidates.entry(pair_id).or_default();
         group.candidate_count += 1;
-        if group.images.contains_key(&side) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = group.images.entry(side) {
+            entry.insert(image);
+        } else {
             // A duplicate side is ambiguous. Leave it untouched instead of deleting the wrong file.
             skipped_count += 1;
-        } else {
-            group.images.insert(side, image);
         }
     }
 
@@ -102,8 +110,12 @@ fn scan_image_pairs(folder_path: String) -> Result<ScanResult, String> {
                 images: candidate.images.into_values().collect(),
             });
         } else if image_count == 1 {
-            ready_to_rename_count += 1;
-            skipped_count += 1;
+            // A number with only one valid candidate is still actionable: show it
+            // so the user can confirm it and normalize `013-01.jpeg` to `013.jpeg`.
+            groups.push(ImageGroup {
+                id,
+                images: candidate.images.into_values().collect(),
+            });
         }
     }
 
@@ -111,6 +123,7 @@ fn scan_image_pairs(folder_path: String) -> Result<ScanResult, String> {
         groups,
         skipped_count,
         ready_to_rename_count,
+        ready_to_enhance_count,
     })
 }
 
@@ -168,10 +181,7 @@ fn finalize_selection(keep_path: String, discard_paths: Vec<String>) -> Result<(
 }
 
 fn final_image_path(keep_path: &Path, discard_paths: &[PathBuf]) -> Result<PathBuf, String> {
-    if !keep_path.is_file()
-        || discard_paths.is_empty()
-        || discard_paths.iter().any(|path| !path.is_file())
-    {
+    if !keep_path.is_file() || discard_paths.iter().any(|path| !path.is_file()) {
         return Err("선택할 이미지 파일을 찾지 못했습니다.".into());
     }
     if !is_image_path(keep_path) || discard_paths.iter().any(|path| !is_image_path(path)) {
@@ -294,6 +304,23 @@ fn normalize_remaining_images(folder_path: String) -> Result<NormalizeResult, St
         renamed_count: renamed.len(),
         skipped_count,
     })
+}
+
+#[tauri::command]
+async fn enhance_selected_images(
+    app: tauri::AppHandle,
+    folder_path: String,
+) -> Result<enhance::EnhanceResult, String> {
+    enhance::enhance_selected_folder(app, PathBuf::from(folder_path)).await
+}
+
+#[tauri::command]
+async fn enhance_selected_files(
+    app: tauri::AppHandle,
+    file_paths: Vec<String>,
+) -> Result<enhance::EnhanceResult, String> {
+    let files = file_paths.into_iter().map(PathBuf::from).collect();
+    enhance::enhance_selected_files(app, files).await
 }
 
 #[tauri::command]
@@ -420,11 +447,14 @@ fn split_pair_name(stem: &str) -> Option<(String, u8)> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             scan_image_pairs,
             load_image_data_url,
             finalize_selection,
             normalize_remaining_images,
+            enhance_selected_images,
+            enhance_selected_files,
             read_text_file,
             split_script_text
         ])
@@ -432,13 +462,29 @@ pub fn run() {
         .expect("error while running Pair Picker");
 }
 
+/// Applies the same 2560x1440 crop, gentle tone, saturation, sharpening, and JPEG pass
+/// used after Real-ESRGAN.
+pub fn postprocess_upscaled_image(source: &Path, destination: &Path) -> Result<(), String> {
+    enhance::enhance_and_save(source, destination)
+}
+
+/// Applies the production enhancement pass at a caller-selected comparison size.
+pub fn postprocess_upscaled_image_to_size(
+    source: &Path,
+    destination: &Path,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    enhance::enhance_and_save_to_size(source, destination, width, height)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::{
-        character_count, final_image_path, scan_image_pairs, split_pair_name, split_script_text,
-        SCRIPT_CHUNK_LIMIT,
+        character_count, final_image_path, finalize_selection, scan_image_pairs, split_pair_name,
+        split_script_text, SCRIPT_CHUNK_LIMIT,
     };
 
     #[test]
@@ -481,6 +527,43 @@ mod tests {
     }
 
     #[test]
+    fn keeps_a_single_candidate_visible_for_selection() {
+        let folder = std::env::temp_dir().join(format!(
+            "pair-picker-single-candidate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("013-01.jpeg"), []).unwrap();
+
+        let result = scan_image_pairs(folder.to_string_lossy().into_owned()).unwrap();
+
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].id, "013");
+        assert_eq!(result.groups[0].images.len(), 1);
+        assert_eq!(result.groups[0].images[0].file_name, "013-01.jpeg");
+        assert_eq!(result.ready_to_rename_count, 0);
+        assert_eq!(result.skipped_count, 0);
+
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn reports_numbered_images_as_ready_for_enhancement() {
+        let folder =
+            std::env::temp_dir().join(format!("pair-picker-ready-enhance-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("001.jpeg"), []).unwrap();
+        std::fs::write(folder.join("002.png"), []).unwrap();
+        std::fs::write(folder.join("cover.jpeg"), []).unwrap();
+
+        let result = scan_image_pairs(folder.to_string_lossy().into_owned()).unwrap();
+
+        assert_eq!(result.ready_to_enhance_count, 2);
+        assert_eq!(result.skipped_count, 1);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
     fn final_filename_removes_the_pair_suffix() {
         let folder = std::env::temp_dir().join(format!("pair-picker-test-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
@@ -493,6 +576,27 @@ mod tests {
             final_image_path(&keep, &[discard]).unwrap(),
             Path::new(&folder).join("001.jpeg")
         );
+
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn final_filename_supports_a_single_candidate_without_discard() {
+        let folder = std::env::temp_dir().join(format!(
+            "pair-picker-single-finalize-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let keep = folder.join("013-01.jpeg");
+        std::fs::write(&keep, []).unwrap();
+
+        assert_eq!(
+            final_image_path(&keep, &[]).unwrap(),
+            Path::new(&folder).join("013.jpeg")
+        );
+        finalize_selection(keep.to_string_lossy().into_owned(), vec![]).unwrap();
+        assert!(folder.join("013.jpeg").is_file());
+        assert!(!keep.exists());
 
         std::fs::remove_dir_all(folder).unwrap();
     }
